@@ -110,6 +110,35 @@ void arena_reset(arena* a);
     ((type*)arena_alloc_((a), sizeof(type), (count), _Alignof(type)))
 void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align);
 
+/* A saved position in an arena, to rewind to with arena_rewind(). The fields
+ * should not be written to by the user.
+ */
+typedef struct {
+    arena_block* block; /* Current block when saved */
+    arena_block* prev;  /* Block behind it when saved */
+    size_t used;        /* Bytes used in the current block when saved */
+} arena_mark;
+
+/* Save the current position of the arena, so that every allocation made after
+ * it can be freed at once with arena_rewind().
+ *
+ * Marks can be nested. A mark is invalidated by rewinding to an earlier mark,
+ * and by arena_reset() and arena_free().
+ *
+ *  a       is the arena to save the position of
+ */
+arena_mark arena_save(arena* a);
+
+/* Rewind the arena to a position saved with arena_save(). Every allocation made
+ * after it is freed, including any blocks that were added. Pointers returned by
+ * arena_alloc() before the mark stay valid, pointers returned after it are
+ * invalidated. The mark stays valid and can be rewound to again.
+ *
+ *  a       is the arena to rewind
+ *  mark    is the saved position, has to be valid for this arena
+ */
+void arena_rewind(arena* a, arena_mark mark);
+
 #ifdef ARENA_IMPLEMENTATION
 
 /* Allocate a new block with the given capacity, and count it towards the total
@@ -141,6 +170,15 @@ static arena_block* arena_newblock_(arena* a, size_t capacity)
     }
 
     return b;
+}
+
+/* Free a block that is no longer linked into the arena, and remove it from the
+ * total of the arena.
+ */
+static void arena_freeblock_(arena* a, arena_block* b)
+{
+    a->total -= b->capacity;
+    ARENA_FREE(b);
 }
 
 /* Find where size bytes with the given alignment fit in a block, when used
@@ -206,8 +244,7 @@ void arena_reset(arena* a)
         if (!keep && b->capacity == a->blocksize) {
             keep = b;
         } else {
-            a->total -= b->capacity;
-            ARENA_FREE(b);
+            arena_freeblock_(a, b);
         }
         b = prev;
     }
@@ -269,6 +306,65 @@ void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align)
     }
 
     return memset(dst, 0, size);
+}
+
+arena_mark arena_save(arena* a)
+{
+    ARENA_ASSERT(a);
+
+    return (arena_mark){
+        .block = a->block,
+        .prev = a->block ? a->block->prev : NULL,
+        .used = a->used,
+    };
+}
+
+void arena_rewind(arena* a, arena_mark mark)
+{
+    ARENA_ASSERT(a);
+
+    /* Check the mark before freeing anything. The marked block, and the block
+     * that was behind it, have to still be in the chain. Otherwise the mark
+     * was invalidated by an earlier rewind or reset, or belongs to another
+     * arena. */
+    arena_block* b = a->block;
+    while (b && b != mark.block) {
+        b = b->prev;
+    }
+    ARENA_ASSERT(b == mark.block);
+    if (mark.block) {
+        b = mark.block->prev;
+        while (b && b != mark.prev) {
+            b = b->prev;
+        }
+        ARENA_ASSERT(b == mark.prev);
+    }
+    /* Rewinding within the current block can only go backwards */
+    ARENA_ASSERT(mark.block != a->block || mark.used <= a->used);
+
+    /* Free the blocks added in front of the marked block */
+    b = a->block;
+    while (b != mark.block) {
+        arena_block* prev = b->prev;
+        arena_freeblock_(a, b);
+        b = prev;
+    }
+
+    /* Oversized blocks allocated while the marked block was current were put
+     * directly behind it. Free them too, up to the block that was behind it
+     * when the mark was saved. */
+    if (mark.block) {
+        b = mark.block->prev;
+        while (b != mark.prev) {
+            arena_block* prev = b->prev;
+            arena_freeblock_(a, b);
+            b = prev;
+        }
+        mark.block->prev = mark.prev;
+    }
+
+    a->block = mark.block;
+    a->used = mark.used;
 }
 
 #endif /* ARENA_IMPLEMENTATION */

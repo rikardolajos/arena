@@ -556,6 +556,189 @@ void test_reset_empty()
     arena_free(&a);
 }
 
+void test_rewind()
+{
+    arena a = arena_make(64, 0);
+
+    int* p = arena_alloc(&a, int, 2);
+    p[0] = 1;
+    p[1] = 2;
+
+    arena_mark m = arena_save(&a);
+    CHECK(m.block == a.block);
+    CHECK(m.used == 2 * sizeof(int));
+
+    int* q = arena_alloc(&a, int, 4);
+    memset(q, 0xff, 4 * sizeof(int));
+
+    arena_rewind(&a, m);
+    CHECK(a.used == 2 * sizeof(int));
+
+    /* Allocations from before the mark are kept */
+    CHECK(p[0] == 1);
+    CHECK(p[1] == 2);
+
+    /* The rewound memory is handed out again, zeroed */
+    int* r = arena_alloc(&a, int, 4);
+    CHECK(r == q);
+    for (int i = 0; i < 4; i++) {
+        CHECK(r[i] == 0);
+    }
+
+    arena_free(&a);
+}
+
+void test_rewind_frees_blocks()
+{
+    arena a = arena_make(64, 0);
+    arena_block* first = a.block;
+
+    arena_alloc(&a, uint8_t, 8);
+    arena_mark m = arena_save(&a);
+
+    /* Grow to four blocks, one of them oversized */
+    arena_alloc(&a, uint8_t, 64);
+    arena_alloc(&a, uint8_t, 64);
+    arena_alloc(&a, uint8_t, 200);
+    arena_alloc(&a, uint8_t, 64);
+    size_t peak = a.total;
+
+    int frees = free_calls;
+    arena_rewind(&a, m);
+    CHECK(free_calls == frees + 4);
+    CHECK(a.block == first);
+    CHECK(a.block->prev == NULL);
+    CHECK(a.used == 8);
+    CHECK(a.total == 64);
+    CHECK(a.peak == peak);
+
+    arena_free(&a);
+}
+
+void test_rewind_oversized_behind()
+{
+    arena a = arena_make(64, 0);
+    arena_block* first = a.block;
+
+    /* Grow to two blocks, so the marked block has one behind it */
+    arena_alloc(&a, uint8_t, 64);
+    arena_alloc(&a, uint8_t, 8);
+    arena_block* second = a.block;
+    CHECK(second->prev == first);
+
+    arena_mark m = arena_save(&a);
+
+    /* Oversized blocks go directly behind the marked block, which stays
+     * current, so they are not in front of it */
+    arena_alloc(&a, uint8_t, 200);
+    arena_alloc(&a, uint8_t, 300);
+    CHECK(a.block == second);
+    CHECK(second->prev != first);
+
+    int frees = free_calls;
+    arena_rewind(&a, m);
+    CHECK(free_calls == frees + 2);
+    CHECK(a.block == second);
+    CHECK(second->prev == first);
+    CHECK(a.used == 8);
+    CHECK(a.total == 2 * 64);
+
+    arena_free(&a);
+}
+
+void test_rewind_nested()
+{
+    arena a = arena_make(64, 0);
+
+    arena_alloc(&a, uint8_t, 8);
+    arena_mark outer = arena_save(&a);
+
+    arena_alloc(&a, uint8_t, 40);
+    arena_mark inner = arena_save(&a);
+
+    arena_alloc(&a, uint8_t, 100);
+    arena_alloc(&a, uint8_t, 40);
+
+    /* Rewind the inner mark, and reuse it */
+    arena_rewind(&a, inner);
+    CHECK(a.used == 48);
+    CHECK(a.total == 64);
+
+    arena_alloc(&a, uint8_t, 40);
+    arena_rewind(&a, inner);
+    CHECK(a.used == 48);
+    CHECK(a.total == 64);
+
+    /* Rewinding the outer mark also frees what the inner mark kept */
+    arena_rewind(&a, outer);
+    CHECK(a.used == 8);
+    CHECK(a.total == 64);
+
+    arena_free(&a);
+}
+
+void test_rewind_empty()
+{
+    /* A mark saved before the arena has any block rewinds to no blocks */
+    arena a = arena_make(0, 0);
+    arena_mark m = arena_save(&a);
+    CHECK(m.block == NULL);
+
+    arena_alloc(&a, int, 4);
+    arena_alloc(&a, int, 4);
+
+    int frees = free_calls;
+    arena_rewind(&a, m);
+    CHECK(free_calls == frees + 2);
+    CHECK(a.block == NULL);
+    CHECK(a.used == 0);
+    CHECK(a.total == 0);
+
+    arena_free(&a);
+}
+
+void test_rewind_invalid()
+{
+    arena a = arena_make(64, 0);
+
+    arena_mark outer = arena_save(&a);
+    arena_alloc(&a, uint8_t, 40);
+
+    /* Rewinding to the outer mark moves back past the inner mark, within the
+     * same block */
+    arena_mark inner = arena_save(&a);
+    arena_rewind(&a, outer);
+    CHECK_ASSERTS(arena_rewind(&a, inner));
+    CHECK(a.used == 0);
+
+    /* The outer mark frees the block the inner mark was saved in */
+    arena_alloc(&a, uint8_t, 64);
+    arena_alloc(&a, uint8_t, 8);
+    inner = arena_save(&a);
+    arena_rewind(&a, outer);
+    CHECK_ASSERTS(arena_rewind(&a, inner));
+
+    /* A mark from another arena */
+    arena b = arena_make(64, 0);
+    arena_mark other = arena_save(&b);
+    CHECK_ASSERTS(arena_rewind(&a, other));
+    arena_free(&b);
+
+    /* Reset drops the block that was behind the marked block */
+    arena_alloc(&a, uint8_t, 64);
+    arena_alloc(&a, uint8_t, 8);
+    arena_mark m = arena_save(&a);
+    arena_reset(&a);
+    arena_alloc(&a, uint8_t, 200);
+    CHECK_ASSERTS(arena_rewind(&a, m));
+
+    /* Nothing was changed by the failed calls */
+    CHECK(a.block->prev != NULL);
+    CHECK(a.total == 64 + 200);
+
+    arena_free(&a);
+}
+
 void test_free_blocks()
 {
     arena a = arena_make(16, 0);
@@ -602,6 +785,14 @@ int main()
     test_reset_oversized_oldest();
     test_reset_no_regular_block();
     test_reset_empty();
+
+    printf("Testing arena_save() and arena_rewind()\n");
+    test_rewind();
+    test_rewind_frees_blocks();
+    test_rewind_oversized_behind();
+    test_rewind_nested();
+    test_rewind_empty();
+    test_rewind_invalid();
 
     if (failures) {
         printf("=== ARENA TESTS FAILED: %d check(s) ===\n", failures);
