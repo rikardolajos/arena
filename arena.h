@@ -31,10 +31,6 @@
 #define ARENA_MALLOC(sz) malloc(sz)
 #endif
 
-#ifndef ARENA_REALLOC
-#define ARENA_REALLOC(p, sz) realloc(p, sz)
-#endif
-
 #ifndef ARENA_FREE
 #define ARENA_FREE(p) free(p)
 #endif
@@ -43,44 +39,68 @@
 #define ARENA_ASSERT(cond) assert(cond)
 #endif
 
-/* A memory arena. Allocations are made by bumping an offset into a single
- * block of memory, and are all freed at once with arena_reset() or
- * arena_free(). The fields should not be written to by the user.
+/* A block of memory in an arena. The data follows directly after this header
+ * in the same allocation. Blocks are chained from the newest to the oldest.
+ */
+typedef struct arena_block arena_block;
+struct arena_block {
+    arena_block* prev; /* Previous (older) block, NULL for the oldest */
+    size_t capacity;   /* Capacity of the data in bytes */
+};
+
+/* A memory arena. Allocations are made by bumping an offset into the current
+ * block, and a new block is added when it is full. Allocations are never moved,
+ * and are all freed at once with arena_reset() or arena_free(). The fields
+ * should not be written to by the user.
+ *
+ * Capacities count the data of the blocks, not the small header of each block.
  */
 typedef struct {
-    uint8_t* data;   /* Memory block */
-    size_t used;     /* Bytes used, including alignment padding */
-    size_t capacity; /* Capacity in bytes */
+    arena_block* block; /* Current block, NULL if there is none */
+    size_t used;        /* Bytes used in the current block */
+    size_t blocksize;   /* Capacity of new blocks in bytes */
+    size_t limit;       /* Maximum total capacity in bytes, 0 for no limit */
+    size_t total;       /* Total capacity of all blocks in bytes */
+    size_t peak;        /* Highest total capacity reached, kept on reset */
 } arena;
 
-/* Make a new arena with a fixed capacity. An arena has to be freed using
+/* Make a new arena, starting with one block. An arena has to be freed using
  * arena_free().
  *
- * On failure data is NULL and capacity is 0. Every allocation from such an
- * arena fails, but it can still be freed.
+ * When the current block is full a new block is added. An allocation that
+ * might not fit in a new block, counting the worst case alignment padding, gets
+ * a block of its own, sized to fit. An allocation is never split across blocks.
+ * The total capacity never grows past limit, an allocation that would need that
+ * fails instead.
  *
- *  capacity    is the capacity in bytes
+ * On failure block is NULL. The arena can still be allocated from (which tries
+ * to add a block again) and freed.
+ *
+ *  blocksize   is the capacity of each block in bytes
+ *  limit       is the maximum total capacity in bytes, or 0 for no limit
  */
-arena arena_make(size_t capacity);
+arena arena_make(size_t blocksize, size_t limit);
 
-/* Free the memory block of the arena and reset fields to zero. Every pointer
+/* Free all blocks of the arena and reset fields to zero. Every pointer
  * returned by arena_alloc() is invalidated.
  *
  *  a       is the arena to free
  */
 void arena_free(arena* a);
 
-/* Reset the arena so that its whole capacity can be reused. The memory block
- * is kept, but every pointer returned by arena_alloc() is invalidated.
+/* Reset the arena so that its memory can be reused. One block of blocksize is
+ * kept, if there is one, and every other block is freed, so memory used by a
+ * single large peak is given back. Every pointer returned by arena_alloc() is
+ * invalidated.
  *
  *  a       is the arena to reset
  */
 void arena_reset(arena* a);
 
 /* Allocate count elements of a type from the arena, aligned for that type.
- * Returns a pointer to the first element, or NULL if there is not enough space
- * left, in which case the arena is left unchanged. Allocating zero elements
- * also returns NULL. Elements are zero-initialized.
+ * Returns a pointer to the first element, or NULL if a new block was needed
+ * and could not be added, in which case the arena is left unchanged.
+ * Allocating zero elements also returns NULL. Elements are zero-initialized.
  *
  *  a       is the arena to allocate from
  *  type    is the type of the elements
@@ -92,31 +112,84 @@ void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align);
 
 #ifdef ARENA_IMPLEMENTATION
 
-arena arena_make(size_t capacity)
+/* Allocate a new block with the given capacity, and count it towards the total
+ * of the arena. The block is not linked into the arena. Returns NULL if the
+ * limit would be exceeded or the allocation fails.
+ */
+static arena_block* arena_newblock_(arena* a, size_t capacity)
 {
-    arena empty = {0};
-
-    if (capacity == 0) {
-        return empty;
+    if (capacity > SIZE_MAX - sizeof(arena_block)) {
+        return NULL;
     }
 
-    void* data = ARENA_MALLOC(capacity);
-    if (!data) {
-        return empty;
+    /* The total never exceeds the limit, so this cannot wrap around */
+    if (a->limit != 0 && capacity > a->limit - a->total) {
+        return NULL;
     }
 
-    return (arena){
-        .data = data,
-        .used = 0,
-        .capacity = capacity,
-    };
+    arena_block* b = ARENA_MALLOC(sizeof(arena_block) + capacity);
+    if (!b) {
+        return NULL;
+    }
+
+    b->prev = NULL;
+    b->capacity = capacity;
+
+    a->total += capacity;
+    if (a->total > a->peak) {
+        a->peak = a->total;
+    }
+
+    return b;
+}
+
+/* Find where size bytes with the given alignment fit in a block, when used
+ * bytes of it are already taken. Returns NULL if they do not fit.
+ */
+static uint8_t* arena_fit_(arena_block* b, size_t used, size_t size,
+                           size_t align)
+{
+    uint8_t* data = (uint8_t*)(b + 1);
+
+    /* Pad from the actual address rather than the offset, so any alignment
+     * works regardless of how the block itself is aligned */
+    uintptr_t cur = (uintptr_t)data + used;
+    size_t misalign = (size_t)(cur & (align - 1));
+    size_t pad = (align - misalign) & (align - 1);
+
+    /* Written as subtractions so nothing can wrap around */
+    size_t left = b->capacity - used;
+    if (pad > left || size > left - pad) {
+        return NULL;
+    }
+
+    return data + used + pad;
+}
+
+arena arena_make(size_t blocksize, size_t limit)
+{
+    arena a = {.blocksize = blocksize, .limit = limit};
+
+    if (blocksize == 0) {
+        return a;
+    }
+
+    a.block = arena_newblock_(&a, blocksize);
+
+    return a;
 }
 
 void arena_free(arena* a)
 {
     ARENA_ASSERT(a);
 
-    ARENA_FREE(a->data);
+    arena_block* b = a->block;
+    while (b) {
+        arena_block* prev = b->prev;
+        ARENA_FREE(b);
+        b = prev;
+    }
+
     memset(a, 0, sizeof(*a));
 }
 
@@ -124,6 +197,25 @@ void arena_reset(arena* a)
 {
     ARENA_ASSERT(a);
 
+    /* Keep the newest block of the regular size and free every other block.
+     * Oversized blocks can be anywhere in the chain, so check them all. */
+    arena_block* keep = NULL;
+    arena_block* b = a->block;
+    while (b) {
+        arena_block* prev = b->prev;
+        if (!keep && b->capacity == a->blocksize) {
+            keep = b;
+        } else {
+            a->total -= b->capacity;
+            ARENA_FREE(b);
+        }
+        b = prev;
+    }
+
+    if (keep) {
+        keep->prev = NULL;
+    }
+    a->block = keep;
     a->used = 0;
 }
 
@@ -138,20 +230,43 @@ void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align)
     }
     size_t size = elemsize * count;
 
-    /* Pad from the actual address rather than the offset, so any alignment
-     * works regardless of how the block itself is aligned */
-    uintptr_t cur = (uintptr_t)a->data + a->used;
-    size_t misalign = (size_t)(cur & (align - 1));
-    size_t pad = (align - misalign) & (align - 1);
+    /* Fast path, it fits in the current block */
+    if (a->block) {
+        uint8_t* dst = arena_fit_(a->block, a->used, size, align);
+        if (dst) {
+            a->used = (size_t)(dst - (uint8_t*)(a->block + 1)) + size;
+            return memset(dst, 0, size);
+        }
+    }
 
-    /* Written as subtractions so nothing can wrap around */
-    size_t left = a->capacity - a->used;
-    if (pad > left || size > left - pad) {
+    /* A new block needs room for the worst case padding as well */
+    if (size > SIZE_MAX - (align - 1)) {
+        return NULL;
+    }
+    size_t capacity = size + (align - 1);
+    int oversized = capacity > a->blocksize;
+    if (!oversized) {
+        capacity = a->blocksize;
+    }
+
+    arena_block* b = arena_newblock_(a, capacity);
+    if (!b) {
         return NULL;
     }
 
-    uint8_t* dst = a->data + a->used + pad;
-    a->used += pad + size;
+    uint8_t* dst = arena_fit_(b, 0, size, align);
+    ARENA_ASSERT(dst);
+
+    if (oversized && a->block) {
+        /* The oversized block is filled by this allocation alone. Put it
+         * behind the current block, which may still have room left. */
+        b->prev = a->block->prev;
+        a->block->prev = b;
+    } else {
+        b->prev = a->block;
+        a->block = b;
+        a->used = (size_t)(dst - (uint8_t*)(b + 1)) + size;
+    }
 
     return memset(dst, 0, size);
 }
