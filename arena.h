@@ -154,6 +154,30 @@ void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align);
 void* arena_copy_(arena* a, const void* src, size_t elemsize, size_t count,
                   size_t align);
 
+/* Grow, or shrink, the last allocation of the arena in place. Returns p, or
+ * NULL if p is not the last allocation in the current block or the new size
+ * does not fit in it, in which case the arena is left unchanged. New elements
+ * are zero-initialized.
+ *
+ * On failure, the elements have to be moved by the caller if more room is
+ * needed, e.g. with arena_alloc() and memcpy(). The last allocation is not
+ * growable if it got a block of its own.
+ *
+ * Growing after arena_save() counts as allocating after the mark, and is
+ * undone by arena_rewind(). Shrinking below a mark invalidates it.
+ *
+ *  a           is the arena that p was allocated from
+ *  type        is the type of the elements
+ *  p           is the last allocation
+ *  oldcount    is the number of elements p currently has
+ *  newcount    is the new number of elements, must not be 0
+ */
+#define arena_grow_last(a, type, p, oldcount, newcount)                        \
+    ((type*)arena_grow_last_((a), (1 ? (p) : (type*)NULL), sizeof(type),       \
+                             (oldcount), (newcount)))
+void* arena_grow_last_(arena* a, void* p, size_t elemsize, size_t oldcount,
+                       size_t newcount);
+
 /* Copy a null-terminated string into the arena. Returns a pointer to the copy,
  * or NULL on failure.
  *
@@ -433,6 +457,45 @@ void* arena_copy_(arena* a, const void* src, size_t elemsize, size_t count,
     }
 
     return memcpy(dst, src, elemsize * count);
+}
+
+void* arena_grow_last_(arena* a, void* p, size_t elemsize, size_t oldcount,
+                       size_t newcount)
+{
+    ARENA_ASSERT(a);
+    ARENA_ASSERT(p);
+    ARENA_ASSERT(oldcount != 0 && newcount != 0);
+
+    if (elemsize == 0 || oldcount > SIZE_MAX / elemsize ||
+        newcount > SIZE_MAX / elemsize) {
+        return NULL;
+    }
+    size_t oldsize = elemsize * oldcount;
+    size_t newsize = elemsize * newcount;
+
+    /* Allocations never overlap, so only the last allocation in the current
+     * block ends exactly where the used part of the block ends */
+    if (!a->block || oldsize > a->used) {
+        return NULL;
+    }
+    size_t start = a->used - oldsize;
+    uint8_t* data = (uint8_t*)(a->block + 1);
+    if ((uint8_t*)p != data + start) {
+        return NULL;
+    }
+
+    if (newsize > a->block->capacity - start) {
+        return NULL;
+    }
+
+    if (newsize > oldsize) {
+        memset((uint8_t*)p + oldsize, 0, newsize - oldsize);
+    } else {
+        arena_poison_((uint8_t*)p + newsize, oldsize - newsize);
+    }
+    a->used = start + newsize;
+
+    return p;
 }
 
 /* Copy len chars of s into the arena, and terminate the copy */

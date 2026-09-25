@@ -129,6 +129,29 @@ int* copy = arena_copy(&a, int, ((int[]){1, 2, 3}), 3);
 `arena_copy()` checks that the type of the source pointer matches the element type, and GCC and Clang check the format string of `arena_sprintf()`, both as compiler warnings.
 Note that a macro argument containing a comma, like the compound literal above, has to be wrapped in parentheses.
 
+### Growing the last allocation
+
+`arena_grow_last()` grows the most recent allocation in place, as long as it is still at the end of the current block and there is room left in it.
+Otherwise it returns `NULL` and changes nothing, and the elements have to be moved to a new allocation.
+This makes a dynamic array inside an arena cheap while nothing else is allocated in between:
+
+```C
+if (count == capacity) {
+    int* p = arena_grow_last(&a, int, arr, capacity, 2 * capacity);
+    if (!p) {
+        /* Not the last allocation, or no room left, so move it */
+        p = arena_alloc(&a, int, 2 * capacity);
+        memcpy(p, arr, count * sizeof(int));
+    }
+    arr = p;
+    capacity *= 2;
+}
+arr[count++] = value;
+```
+
+A moved array leaves its old memory unused in the arena until it is reset.
+`arena_grow_last()` can also shrink the last allocation, which gives the rest of it back to the arena.
+
 For details of the implementation and which functions are available, check the header file.
 
 More examples of usage can be found in the `test.c` file.

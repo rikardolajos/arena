@@ -962,6 +962,190 @@ void test_sprintf_failure()
     arena_free(&a);
 }
 
+void test_grow_last()
+{
+    arena a = arena_make(64, 0);
+
+    int* p = arena_alloc(&a, int, 4);
+    for (int i = 0; i < 4; i++) {
+        p[i] = i + 1;
+    }
+
+    /* Grows in place, keeping the elements and zeroing the new ones */
+    int* q = arena_grow_last(&a, int, p, 4, 8);
+    CHECK(q == p);
+    CHECK(a.used == 8 * sizeof(int));
+    for (int i = 0; i < 4; i++) {
+        CHECK(p[i] == i + 1);
+        CHECK(p[4 + i] == 0);
+    }
+
+    /* Growing to the same size does nothing */
+    CHECK(arena_grow_last(&a, int, p, 8, 8) == p);
+    CHECK(a.used == 8 * sizeof(int));
+
+    /* The next allocation comes after the grown one */
+    int* r = arena_alloc(&a, int, 1);
+    CHECK(r == p + 8);
+
+    arena_free(&a);
+}
+
+void test_grow_last_shrink()
+{
+    arena a = arena_make(64, 0);
+
+    int* p = arena_alloc(&a, int, 8);
+    memset(p, 0x11, 8 * sizeof(int));
+
+    /* Shrinking gives the tail back */
+    CHECK(arena_grow_last(&a, int, p, 8, 2) == p);
+    CHECK(a.used == 2 * sizeof(int));
+    CHECK(all_bytes(p, 2 * sizeof(int), 0x11));
+    CHECK(all_bytes(p + 2, 6 * sizeof(int), given_back(0x11)));
+
+    /* And the next allocation reuses it */
+    CHECK(arena_alloc(&a, int, 1) == p + 2);
+
+    arena_free(&a);
+}
+
+void test_grow_last_not_last()
+{
+    arena a = arena_make(64, 0);
+
+    int* p = arena_alloc(&a, int, 4);
+    int* q = arena_alloc(&a, int, 4);
+
+    /* p is followed by q, so growing it in place would overwrite q */
+    CHECK(arena_grow_last(&a, int, p, 4, 5) == NULL);
+    CHECK(a.used == 8 * sizeof(int));
+
+    /* A wrong count does not match the end either */
+    CHECK(arena_grow_last(&a, int, q, 3, 5) == NULL);
+    CHECK(a.used == 8 * sizeof(int));
+
+    /* Not from this arena at all */
+    int local[4] = {0};
+    CHECK(arena_grow_last(&a, int, local, 4, 5) == NULL);
+
+    arena_free(&a);
+}
+
+void test_grow_last_no_room()
+{
+    arena a = arena_make(64, 0);
+
+    int* p = arena_alloc(&a, int, 12);
+
+    /* Would need more than the 64 bytes of the block, and never adds one */
+    int calls = malloc_calls;
+    CHECK(arena_grow_last(&a, int, p, 12, 17) == NULL);
+    CHECK(malloc_calls == calls);
+    CHECK(a.used == 12 * sizeof(int));
+
+    /* Exactly fills the block */
+    CHECK(arena_grow_last(&a, int, p, 12, 16) == p);
+    CHECK(a.used == 64);
+
+    /* Too large to count in bytes */
+    CHECK(arena_grow_last(&a, int, p, 16, SIZE_MAX) == NULL);
+    CHECK(a.used == 64);
+
+    CHECK_ASSERTS(arena_grow_last(&a, int, p, 16, 0));
+    CHECK_ASSERTS(arena_grow_last(&a, int, (int*)NULL, 16, 17));
+
+    arena_free(&a);
+}
+
+void test_grow_last_oversized()
+{
+    arena a = arena_make(64, 0);
+
+    arena_alloc(&a, int, 1);
+    int* big = arena_alloc(&a, int, 100);
+
+    /* It is the last allocation, but in a block of its own behind the
+     * current block */
+    CHECK(arena_grow_last(&a, int, big, 100, 101) == NULL);
+    CHECK(a.used == sizeof(int));
+
+    arena_free(&a);
+}
+
+void test_grow_last_mark()
+{
+    arena a = arena_make(64, 0);
+
+    uint8_t* p = arena_alloc(&a, uint8_t, 8);
+    arena_mark m = arena_save(&a);
+
+    /* Growing after the mark is undone by rewinding */
+    CHECK(arena_grow_last(&a, uint8_t, p, 8, 16) == p);
+    arena_rewind(&a, m);
+    CHECK(a.used == 8);
+
+    /* Shrinking below the mark invalidates it */
+    CHECK(arena_grow_last(&a, uint8_t, p, 8, 4) == p);
+    CHECK_ASSERTS(arena_rewind(&a, m));
+    CHECK(a.used == 4);
+
+    arena_free(&a);
+}
+
+void test_grow_last_dynamic_array()
+{
+    arena a = arena_make(256, 0);
+
+    size_t count = 0;
+    size_t capacity = 4;
+    int* arr = arena_alloc(&a, int, capacity);
+    int grown = 0;
+    int moved = 0;
+
+    for (int i = 0; i < 100; i++) {
+        if (count == capacity) {
+            int* p = arena_grow_last(&a, int, arr, capacity, 2 * capacity);
+            if (p) {
+                grown++;
+            } else {
+                /* Not last, or no room left in the block, so move it */
+                p = arena_alloc(&a, int, 2 * capacity);
+                memcpy(p, arr, count * sizeof(int));
+                moved++;
+            }
+            arr = p;
+            capacity *= 2;
+        }
+        arr[count++] = i;
+    }
+
+    /* 4 -> 8 -> 16 -> 32 -> 64 ints fill the 256 byte block in place, and
+     * only 128 ints has to move to a block of its own */
+    CHECK(grown == 4);
+    CHECK(moved == 1);
+    for (int i = 0; i < 100; i++) {
+        CHECK(arr[i] == i);
+    }
+
+    arena_free(&a);
+}
+
+void test_grow_last_string()
+{
+    arena a = arena_make(64, 0);
+
+    /* Append to the last string, overwriting its terminator */
+    char* s = arena_sprintf(&a, "level-%d", 3);
+    size_t len = strlen(s);
+    CHECK(arena_grow_last(&a, char, s, len + 1, len + 5) == s);
+    memcpy(s + len, ".map", 5);
+    CHECK(strcmp(s, "level-3.map") == 0);
+    CHECK(a.used == strlen("level-3.map") + 1);
+
+    arena_free(&a);
+}
+
 void test_poison_reset()
 {
     arena a = arena_make(64, 0);
@@ -1131,6 +1315,16 @@ int main()
     test_sprintf();
     test_vsprintf();
     test_sprintf_failure();
+
+    printf("Testing arena_grow_last()\n");
+    test_grow_last();
+    test_grow_last_shrink();
+    test_grow_last_not_last();
+    test_grow_last_no_room();
+    test_grow_last_oversized();
+    test_grow_last_mark();
+    test_grow_last_dynamic_array();
+    test_grow_last_string();
 
     printf("Testing poisoning (ARENA_POISON %d)\n", ARENA_POISON);
     test_poison_reset();
