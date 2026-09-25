@@ -17,6 +17,7 @@ In **exactly one** C file you will have to define `ARENA_IMPLEMENTATION` before 
 
 The library requires C11 (for `_Alignof`), so with MSVC compile with `/std:c11` or later.
 The allocator and assertion can be replaced by defining `ARENA_MALLOC(sz)`, `ARENA_FREE(p)`, and `ARENA_ASSERT(cond)` before including the implementation.
+Debug poisoning of freed memory is controlled by `ARENA_POISON`, see [Safety](#safety).
 
 Make an arena with `arena_make()`, allocate from it with `arena_alloc()`, and free all its memory with `arena_free()` after use.
 Access the fields of the `arena` struct to see the details of the arena:
@@ -142,6 +143,11 @@ If `arena_make()` fails, `block` is `NULL`, and the arena can still be allocated
 Memory from `arena_alloc()` is zero-initialized and aligned for its type.
 Using a pointer after the arena was reset, rewound past it, or freed is not detected, and neither is writing past the end of an allocation.
 Some misuse is caught by assertions, like an alignment that is not a power of two, or rewinding to a mark that is no longer valid, but not all of it.
+
+To make stale pointers easier to spot, memory given back by `arena_reset()`, `arena_rewind()`, and `arena_free()` is poisoned: filled with the byte `0xdd`.
+Reading through a stale pointer then gives values like `0xdddddddd` instead of data that still looks valid.
+Like `assert()`, poisoning is on unless `NDEBUG` is defined, since it costs a `memset()` of the memory given back.
+Define `ARENA_POISON` as `1` or `0` to turn it on or off explicitly, and `ARENA_POISON_BYTE` to use another byte.
 
 An arena is not thread-safe. Use one arena per thread, or guard it with a lock.
 

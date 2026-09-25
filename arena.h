@@ -47,6 +47,23 @@
 #define ARENA_ASSERT(cond) assert(cond)
 #endif
 
+/* When ARENA_POISON is 1, memory given back by arena_reset(), arena_rewind()
+ * and arena_free() is filled with ARENA_POISON_BYTE, so that reading through a
+ * stale pointer gives obvious garbage instead of the old data. Like assert(),
+ * it is on unless NDEBUG is defined.
+ */
+#ifndef ARENA_POISON
+#ifdef NDEBUG
+#define ARENA_POISON 0
+#else
+#define ARENA_POISON 1
+#endif
+#endif
+
+#ifndef ARENA_POISON_BYTE
+#define ARENA_POISON_BYTE 0xdd
+#endif
+
 /* A block of memory in an arena. The data follows directly after this header
  * in the same allocation. Blocks are chained from the newest to the oldest.
  */
@@ -238,11 +255,23 @@ static arena_block* arena_newblock_(arena* a, size_t capacity)
     return b;
 }
 
+/* Poison size bytes of memory that is given back, if ARENA_POISON is on */
+static void arena_poison_(void* p, size_t size)
+{
+#if ARENA_POISON
+    memset(p, ARENA_POISON_BYTE, size);
+#else
+    (void)p;
+    (void)size;
+#endif
+}
+
 /* Free a block that is no longer linked into the arena, and remove it from the
  * total of the arena.
  */
 static void arena_freeblock_(arena* a, arena_block* b)
 {
+    arena_poison_(b + 1, b->capacity);
     a->total -= b->capacity;
     ARENA_FREE(b);
 }
@@ -290,7 +319,7 @@ void arena_free(arena* a)
     arena_block* b = a->block;
     while (b) {
         arena_block* prev = b->prev;
-        ARENA_FREE(b);
+        arena_freeblock_(a, b);
         b = prev;
     }
 
@@ -316,7 +345,11 @@ void arena_reset(arena* a)
     }
 
     if (keep) {
+        /* New regular blocks are always added in front, so the newest one is
+         * the current block, and only its used part has to be poisoned */
+        ARENA_ASSERT(keep == a->block);
         keep->prev = NULL;
+        arena_poison_(keep + 1, a->used);
     }
     a->block = keep;
     a->used = 0;
@@ -508,6 +541,13 @@ void arena_rewind(arena* a, arena_mark mark)
     /* Rewinding within the current block can only go backwards */
     ARENA_ASSERT(mark.block != a->block || mark.used <= a->used);
 
+    /* How far the marked block was used, to poison what is given back of it.
+     * If blocks were added in front of it, that offset was not kept. */
+    size_t end = 0;
+    if (mark.block) {
+        end = mark.block == a->block ? a->used : mark.block->capacity;
+    }
+
     /* Free the blocks added in front of the marked block */
     b = a->block;
     while (b != mark.block) {
@@ -527,6 +567,8 @@ void arena_rewind(arena* a, arena_mark mark)
             b = prev;
         }
         mark.block->prev = mark.prev;
+
+        arena_poison_((uint8_t*)(mark.block + 1) + mark.used, end - mark.used);
     }
 
     a->block = mark.block;

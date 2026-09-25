@@ -69,12 +69,42 @@ void* checked_malloc(size_t sz)
     return p;
 }
 
-static int free_calls = 0;
+static int all_bytes(const void* p, size_t size, uint8_t byte)
+{
+    const uint8_t* b = p;
+    for (size_t i = 0; i < size; i++) {
+        if (b[i] != byte)
+            return 0;
+    }
+    return 1;
+}
 
+/* The byte expected in memory given back by the arena, which held old */
+static uint8_t given_back(uint8_t old)
+{
+#if ARENA_POISON
+    (void)old;
+    return ARENA_POISON_BYTE;
+#else
+    return old;
+#endif
+}
+
+static int free_calls = 0;
+static int unpoisoned_frees = 0;
+
+/* Every block is poisoned before it is freed, check it while it can still be
+ * read */
 void checked_free(void* p)
 {
-    if (p)
+    if (p) {
         free_calls++;
+#if ARENA_POISON
+        arena_block* b = p;
+        if (!all_bytes(b + 1, b->capacity, ARENA_POISON_BYTE))
+            unpoisoned_frees++;
+#endif
+    }
     free(p);
 }
 
@@ -932,6 +962,105 @@ void test_sprintf_failure()
     arena_free(&a);
 }
 
+void test_poison_reset()
+{
+    arena a = arena_make(64, 0);
+
+    uint8_t* p = arena_alloc(&a, uint8_t, 16);
+    uint8_t* q = arena_alloc(&a, uint8_t, 8);
+    memset(p, 0x11, 16);
+    memset(q, 0x22, 8);
+
+    /* Reading the kept block through stale pointers is still in bounds */
+    arena_reset(&a);
+    CHECK(all_bytes(p, 16, given_back(0x11)));
+    CHECK(all_bytes(q, 8, given_back(0x22)));
+
+    /* Handed out again, the memory is zeroed as usual */
+    uint8_t* r = arena_alloc(&a, uint8_t, 24);
+    CHECK(r == p);
+    CHECK(all_bytes(r, 24, 0));
+
+    arena_free(&a);
+}
+
+void test_poison_rewind()
+{
+    arena a = arena_make(64, 0);
+
+    uint8_t* p = arena_alloc(&a, uint8_t, 8);
+    memset(p, 0x11, 8);
+
+    arena_mark m = arena_save(&a);
+    uint8_t* q = arena_alloc(&a, uint8_t, 8);
+    memset(q, 0x22, 8);
+
+    /* Only what was allocated after the mark is given back */
+    arena_rewind(&a, m);
+    CHECK(all_bytes(p, 8, 0x11));
+    CHECK(all_bytes(q, 8, given_back(0x22)));
+
+    arena_free(&a);
+}
+
+void test_poison_rewind_abandoned()
+{
+    arena a = arena_make(64, 0);
+    arena_block* first = a.block;
+
+    uint8_t* p = arena_alloc(&a, uint8_t, 8);
+    memset(p, 0x11, 8);
+
+    arena_mark m = arena_save(&a);
+    uint8_t* q = arena_alloc(&a, uint8_t, 40);
+    memset(q, 0x22, 40);
+
+    /* Does not fit in the 16 bytes left, so the marked block is left behind
+     * and how far it was used is not kept */
+    arena_alloc(&a, uint8_t, 32);
+    CHECK(a.block != first);
+
+    arena_rewind(&a, m);
+    CHECK(a.block == first);
+    CHECK(all_bytes(p, 8, 0x11));
+    CHECK(all_bytes(q, 40, given_back(0x22)));
+
+    /* The unused rest of the block was never handed out, and is poisoned
+     * along with it */
+    if (ARENA_POISON) {
+        CHECK(all_bytes(q + 40, 16, ARENA_POISON_BYTE));
+    }
+
+    arena_free(&a);
+}
+
+void test_poison_freed_blocks()
+{
+    int unpoisoned = unpoisoned_frees;
+    int frees = free_calls;
+
+    arena a = arena_make(64, 0);
+    memset(arena_alloc(&a, uint8_t, 64), 0x11, 64);
+
+    /* Freed by rewind, one regular and one oversized block */
+    arena_mark m = arena_save(&a);
+    memset(arena_alloc(&a, uint8_t, 64), 0x22, 64);
+    memset(arena_alloc(&a, uint8_t, 200), 0x33, 200);
+    arena_rewind(&a, m);
+
+    /* Freed by reset */
+    memset(arena_alloc(&a, uint8_t, 64), 0x44, 64);
+    arena_reset(&a);
+
+    /* Freed by arena_free() */
+    memset(arena_alloc(&a, uint8_t, 64), 0x55, 64);
+    memset(arena_alloc(&a, uint8_t, 64), 0x66, 64);
+    arena_free(&a);
+
+    CHECK(free_calls == frees + 5);
+    CHECK(unpoisoned_frees == unpoisoned);
+}
+
 void test_free_blocks()
 {
     arena a = arena_make(16, 0);
@@ -1002,6 +1131,15 @@ int main()
     test_sprintf();
     test_vsprintf();
     test_sprintf_failure();
+
+    printf("Testing poisoning (ARENA_POISON %d)\n", ARENA_POISON);
+    test_poison_reset();
+    test_poison_rewind();
+    test_poison_rewind_abandoned();
+    test_poison_freed_blocks();
+
+    /* Every block freed by any test has to have been poisoned */
+    CHECK(unpoisoned_frees == 0);
 
     if (failures) {
         printf("=== ARENA TESTS FAILED: %d check(s) ===\n", failures);
