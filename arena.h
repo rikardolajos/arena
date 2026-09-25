@@ -22,10 +22,18 @@
 #pragma once
 
 #include <assert.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
+
+/* Lets GCC and Clang check format strings against their arguments */
+#if defined(__GNUC__) || defined(__clang__)
+#define ARENA_PRINTF_(fmt, args) __attribute__((format(printf, fmt, args)))
+#else
+#define ARENA_PRINTF_(fmt, args)
+#endif
 
 #ifndef ARENA_MALLOC
 #define ARENA_MALLOC(sz) malloc(sz)
@@ -110,6 +118,61 @@ void arena_reset(arena* a);
     ((type*)arena_alloc_((a), sizeof(type), (count), _Alignof(type)))
 void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align);
 
+/* Copy count elements of a type into the arena, aligned for that type. Returns
+ * a pointer to the copy, or NULL on failure like arena_alloc(). The source can
+ * be memory from the same arena.
+ *
+ * The pointer type of src is checked against the type, as far as the compiler
+ * warns about mismatched pointer types in a conditional expression. A void
+ * pointer is not checked.
+ *
+ *  a       is the arena to copy into
+ *  type    is the type of the elements
+ *  src     is a pointer to the elements to copy
+ *  count   is the number of elements
+ */
+#define arena_copy(a, type, src, count)                                        \
+    ((type*)arena_copy_((a), (1 ? (src) : (const type*)NULL), sizeof(type),    \
+                        (count), _Alignof(type)))
+void* arena_copy_(arena* a, const void* src, size_t elemsize, size_t count,
+                  size_t align);
+
+/* Copy a null-terminated string into the arena. Returns a pointer to the copy,
+ * or NULL on failure.
+ *
+ *  a       is the arena to copy into
+ *  s       is the string to copy
+ */
+char* arena_strdup(arena* a, const char* s);
+
+/* Copy at most n chars of a string into the arena, and null-terminate the
+ * copy. Stops early at the terminator of s, so s only has to be null-terminated
+ * if it is shorter than n. Returns a pointer to the copy, or NULL on failure.
+ *
+ *  a       is the arena to copy into
+ *  s       is the string to copy
+ *  n       is the maximum number of chars to copy, excluding the terminator
+ */
+char* arena_strndup(arena* a, const char* s, size_t n);
+
+/* Format a string like sprintf() into the arena, sized to fit. Returns a
+ * pointer to the string, or NULL on failure, also when the formatting fails.
+ *
+ *  a       is the arena to format into
+ *  fmt     is the printf() format string
+ */
+char* arena_sprintf(arena* a, const char* fmt, ...) ARENA_PRINTF_(2, 3);
+
+/* Format a string like vsprintf() into the arena, sized to fit. See
+ * arena_sprintf().
+ *
+ *  a       is the arena to format into
+ *  fmt     is the printf() format string
+ *  args    are the arguments for the format string
+ */
+char* arena_vsprintf(arena* a, const char* fmt, va_list args)
+    ARENA_PRINTF_(2, 0);
+
 /* A saved position in an arena, to rewind to with arena_rewind(). The fields
  * should not be written to by the user.
  */
@@ -140,6 +203,9 @@ arena_mark arena_save(arena* a);
 void arena_rewind(arena* a, arena_mark mark);
 
 #ifdef ARENA_IMPLEMENTATION
+
+/* Only the implementation needs vsnprintf() */
+#include <stdio.h>
 
 /* Allocate a new block with the given capacity, and count it towards the total
  * of the arena. The block is not linked into the arena. Returns NULL if the
@@ -256,7 +322,11 @@ void arena_reset(arena* a)
     a->used = 0;
 }
 
-void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align)
+/* Allocate count elements of elemsize bytes with the given alignment, like
+ * arena_alloc_(), but leave the memory uninitialized. For callers that
+ * overwrite all of it right away.
+ */
+static void* arena_take_(arena* a, size_t elemsize, size_t count, size_t align)
 {
     ARENA_ASSERT(a);
     /* Alignment has to be a power of two */
@@ -272,7 +342,7 @@ void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align)
         uint8_t* dst = arena_fit_(a->block, a->used, size, align);
         if (dst) {
             a->used = (size_t)(dst - (uint8_t*)(a->block + 1)) + size;
-            return memset(dst, 0, size);
+            return dst;
         }
     }
 
@@ -305,7 +375,103 @@ void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align)
         a->used = (size_t)(dst - (uint8_t*)(b + 1)) + size;
     }
 
-    return memset(dst, 0, size);
+    return dst;
+}
+
+void* arena_alloc_(arena* a, size_t elemsize, size_t count, size_t align)
+{
+    void* dst = arena_take_(a, elemsize, count, align);
+    if (!dst) {
+        return NULL;
+    }
+
+    /* The size cannot overflow, arena_take_() succeeded */
+    return memset(dst, 0, elemsize * count);
+}
+
+void* arena_copy_(arena* a, const void* src, size_t elemsize, size_t count,
+                  size_t align)
+{
+    ARENA_ASSERT(src || count == 0);
+
+    void* dst = arena_take_(a, elemsize, count, align);
+    if (!dst) {
+        return NULL;
+    }
+
+    return memcpy(dst, src, elemsize * count);
+}
+
+/* Copy len chars of s into the arena, and terminate the copy */
+static char* arena_strcopy_(arena* a, const char* s, size_t len)
+{
+    if (len == SIZE_MAX) {
+        return NULL;
+    }
+
+    char* dst = arena_take_(a, 1, len + 1, 1);
+    if (!dst) {
+        return NULL;
+    }
+
+    memcpy(dst, s, len);
+    dst[len] = '\0';
+
+    return dst;
+}
+
+char* arena_strdup(arena* a, const char* s)
+{
+    ARENA_ASSERT(s);
+
+    return arena_strcopy_(a, s, strlen(s));
+}
+
+char* arena_strndup(arena* a, const char* s, size_t n)
+{
+    ARENA_ASSERT(s);
+
+    /* Like strnlen(), which is not in C11. memchr() stops at the first match,
+     * so it never reads past the terminator of a string shorter than n. */
+    const char* end = memchr(s, '\0', n);
+    size_t len = end ? (size_t)(end - s) : n;
+
+    return arena_strcopy_(a, s, len);
+}
+
+char* arena_sprintf(arena* a, const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char* dst = arena_vsprintf(a, fmt, args);
+    va_end(args);
+
+    return dst;
+}
+
+char* arena_vsprintf(arena* a, const char* fmt, va_list args)
+{
+    ARENA_ASSERT(a);
+    ARENA_ASSERT(fmt);
+
+    /* Measure first, the arguments are used twice so they have to be copied */
+    va_list copy;
+    va_copy(copy, args);
+    int len = vsnprintf(NULL, 0, fmt, copy);
+    va_end(copy);
+
+    if (len < 0) {
+        return NULL;
+    }
+
+    char* dst = arena_take_(a, 1, (size_t)len + 1, 1);
+    if (!dst) {
+        return NULL;
+    }
+
+    vsnprintf(dst, (size_t)len + 1, fmt, args);
+
+    return dst;
 }
 
 arena_mark arena_save(arena* a)

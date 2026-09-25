@@ -1,8 +1,10 @@
 #include <setjmp.h>
+#include <stdarg.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
 
 void* checked_malloc(size_t sz);
 void checked_free(void* p);
@@ -739,6 +741,197 @@ void test_rewind_invalid()
     arena_free(&a);
 }
 
+void test_copy()
+{
+    arena a = arena_make(64, 0);
+
+    int src[4] = {1, 2, 3, 4};
+    int* p = arena_copy(&a, int, src, 4);
+    CHECK(p != NULL);
+    CHECK(p != src);
+    CHECK(a.used == 4 * sizeof(int));
+    for (int i = 0; i < 4; i++) {
+        CHECK(p[i] == src[i]);
+    }
+
+    /* Copying zero elements returns NULL like arena_alloc(), and does not
+     * touch the source */
+    CHECK(arena_copy(&a, int, (int*)NULL, 0) == NULL);
+    CHECK_ASSERTS(arena_copy(&a, int, (int*)NULL, 1));
+    CHECK(a.used == 4 * sizeof(int));
+
+    arena_free(&a);
+}
+
+void test_copy_struct()
+{
+    arena a = arena_make(256, 0);
+
+    point src = {3, 4.5};
+    arena_alloc(&a, char, 1);
+    point* p = arena_copy(&a, point, &src, 1);
+    CHECK(p != NULL);
+    CHECK(is_aligned(p, _Alignof(point)));
+    CHECK(p->x == 3);
+    CHECK(p->y == 4.5);
+
+    arena_free(&a);
+}
+
+void test_copy_from_arena()
+{
+    arena a = arena_make(64, 0);
+
+    int* p = arena_alloc(&a, int, 12);
+    for (int i = 0; i < 12; i++) {
+        p[i] = i;
+    }
+
+    /* Does not fit, so the copy goes to a new block while the source stays
+     * in place */
+    int* q = arena_copy(&a, int, p, 12);
+    CHECK(q != NULL);
+    CHECK(a.block->prev != NULL);
+    for (int i = 0; i < 12; i++) {
+        CHECK(q[i] == i);
+    }
+
+    arena_free(&a);
+}
+
+void test_copy_failure()
+{
+    arena a = arena_make(16, 16);
+
+    int src[8] = {0};
+    CHECK(arena_copy(&a, int, src, 8) == NULL);
+    CHECK(a.used == 0);
+    CHECK(a.total == 16);
+
+    arena_free(&a);
+}
+
+void test_strdup()
+{
+    arena a = arena_make(64, 0);
+
+    const char* s = "hello";
+    char* p = arena_strdup(&a, s);
+    CHECK(p != NULL);
+    CHECK(p != s);
+    CHECK(strcmp(p, "hello") == 0);
+    CHECK(a.used == 6);
+
+    /* The empty string is a valid copy, unlike allocating zero elements */
+    char* e = arena_strdup(&a, "");
+    CHECK(e != NULL);
+    CHECK(e[0] == '\0');
+    CHECK(a.used == 7);
+
+    CHECK_ASSERTS(arena_strdup(&a, NULL));
+
+    arena_free(&a);
+}
+
+void test_strndup()
+{
+    arena a = arena_make(64, 0);
+
+    const char* s = "hello world";
+
+    /* A slice of a longer string */
+    char* p = arena_strndup(&a, s, 5);
+    CHECK(strcmp(p, "hello") == 0);
+    char* q = arena_strndup(&a, s + 6, 5);
+    CHECK(strcmp(q, "world") == 0);
+
+    /* Stops at the terminator when n is larger */
+    char* r = arena_strndup(&a, s, 100);
+    CHECK(strcmp(r, s) == 0);
+
+    char* e = arena_strndup(&a, s, 0);
+    CHECK(e != NULL);
+    CHECK(e[0] == '\0');
+
+    /* The source does not have to be terminated if it is n chars or longer */
+    char buf[3] = {'a', 'b', 'c'};
+    char* t = arena_strndup(&a, buf, 3);
+    CHECK(strcmp(t, "abc") == 0);
+
+    arena_free(&a);
+}
+
+void test_strdup_failure()
+{
+    arena a = arena_make(4, 4);
+
+    CHECK(arena_strdup(&a, "hello") == NULL);
+    CHECK(arena_strndup(&a, "hello", 5) == NULL);
+    CHECK(a.used == 0);
+
+    /* Exactly fits with the terminator */
+    CHECK(arena_strndup(&a, "hello", 3) != NULL);
+    CHECK(a.used == 4);
+
+    arena_free(&a);
+}
+
+void test_sprintf()
+{
+    arena a = arena_make(64, 0);
+
+    char* p = arena_sprintf(&a, "%d-%s-%.2f", 42, "abc", 1.5);
+    CHECK(p != NULL);
+    CHECK(strcmp(p, "42-abc-1.50") == 0);
+    CHECK(a.used == strlen("42-abc-1.50") + 1);
+
+    char* e = arena_sprintf(&a, "%s", "");
+    CHECK(e != NULL);
+    CHECK(e[0] == '\0');
+
+    /* Longer than a block, it gets a block of its own */
+    char* big = arena_sprintf(&a, "%0200d", 7);
+    CHECK(big != NULL);
+    CHECK(strlen(big) == 200);
+    CHECK(big[0] == '0');
+    CHECK(big[199] == '7');
+
+    CHECK_ASSERTS(arena_sprintf(&a, NULL));
+
+    arena_free(&a);
+}
+
+static char* vsprintf_wrapper(arena* a, const char* fmt, ...)
+{
+    va_list args;
+    va_start(args, fmt);
+    char* s = arena_vsprintf(a, fmt, args);
+    va_end(args);
+    return s;
+}
+
+void test_vsprintf()
+{
+    arena a = arena_make(64, 0);
+
+    char* p = vsprintf_wrapper(&a, "%s=%u", "x", 7u);
+    CHECK(p != NULL);
+    CHECK(strcmp(p, "x=7") == 0);
+
+    arena_free(&a);
+}
+
+void test_sprintf_failure()
+{
+    arena a = arena_make(8, 8);
+
+    /* The measured length does not fit, nothing is written */
+    CHECK(arena_sprintf(&a, "%s", "too long for it") == NULL);
+    CHECK(a.used == 0);
+
+    arena_free(&a);
+}
+
 void test_free_blocks()
 {
     arena a = arena_make(16, 0);
@@ -793,6 +986,22 @@ int main()
     test_rewind_nested();
     test_rewind_empty();
     test_rewind_invalid();
+
+    printf("Testing arena_copy()\n");
+    test_copy();
+    test_copy_struct();
+    test_copy_from_arena();
+    test_copy_failure();
+
+    printf("Testing arena_strdup() and arena_strndup()\n");
+    test_strdup();
+    test_strndup();
+    test_strdup_failure();
+
+    printf("Testing arena_sprintf() and arena_vsprintf()\n");
+    test_sprintf();
+    test_vsprintf();
+    test_sprintf_failure();
 
     if (failures) {
         printf("=== ARENA TESTS FAILED: %d check(s) ===\n", failures);
